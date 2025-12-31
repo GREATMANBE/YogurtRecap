@@ -1,0 +1,26 @@
+# Скомпилированные файлы майнкрафта
+/build/
+/run/
+
+# Файлы разработки IDE
+/.idea/
+/.vscode/
+/*.iml
+
+# Кэш Gradle (если используете)
+/.gradle/
+/gradle/
+
+# Локальные конфиги
+/out/
+/production/
+/.settings/
+/.project/
+/.classpath/
+
+# Файлы запуска
+/eclipse/
+/logs/
+/crash-reports/
+/debug/
+/launch-params.json

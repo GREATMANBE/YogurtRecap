@@ -1,0 +1,18 @@
+[
+  {
+    "modid": "yogurtrecap",
+    "name": "YogurtRecap",
+    "description": "Standalone port of ShowSpawnTime's Kills & Gold Tracking feature (Hypixel Zombies).",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "url": "",
+    "updateUrl": "",
+    "authorList": ["ported-by-cursor"],
+    "credits": "Original feature from ShowSpawnTime-2.1.1 by seosean",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]
+
+

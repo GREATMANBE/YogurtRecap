@@ -1,0 +1,15 @@
+{
+  "minVersion": "0.7.11",
+  "package": "com.yogurt.recap.mixins",
+  "refmap": "mixins.yogurtrecap.refmap.json",
+  "compatibilityLevel": "JAVA_8",
+  "verbose": false,
+  "mixins": [
+    "MixinGuiIngame"
+  ],
+  "client": [
+    "MixinGuiIngame"
+  ]
+}
+
+
