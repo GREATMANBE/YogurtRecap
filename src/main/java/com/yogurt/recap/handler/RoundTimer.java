@@ -10,9 +10,11 @@ import net.minecraftforge.fml.common.gameevent.TickEvent;
  */
 public class RoundTimer {
     private long roundStartMillis = -1L;
+    private int titleMissingTicks = 0; // Tolerance before resetting (prevents false resets during brief title changes)
 
     public void onRoundStart() {
         this.roundStartMillis = System.currentTimeMillis();
+        this.titleMissingTicks = 0; // Reset tolerance counter on new round
     }
 
     public int getElapsedMs() {
@@ -34,9 +36,16 @@ public class RoundTimer {
         if (event.phase != TickEvent.Phase.START) {
             return;
         }
-        // If we clearly left Zombies, stop the timer (so elapsed doesn't grow forever).
+        // IMPORTANT: Don't reset immediately on brief "not in zombies" glitches during transitions.
+        // Wait 10 ticks (same as KillsGoldTracker) before resetting to avoid false resets.
         if (!PlayerUtils.isInZombiesTitle()) {
-            roundStartMillis = -1L;
+            titleMissingTicks++;
+            if (titleMissingTicks >= 10) {
+                roundStartMillis = -1L;
+                titleMissingTicks = 0;
+            }
+        } else {
+            titleMissingTicks = 0; // Title is present - reset the missing counter
         }
     }
 }
