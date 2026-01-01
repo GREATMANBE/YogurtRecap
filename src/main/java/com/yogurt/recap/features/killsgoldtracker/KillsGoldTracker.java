@@ -33,13 +33,15 @@ public class KillsGoldTracker {
 
     private static int currentRound = 0;
     private static int currentWave = 0;
-    private static final int REPORT_DELAY_TICKS = 40; // 2 second delay (40 ticks) - gives tablist time to populate
+    private static final int REPORT_DELAY_TICKS = 25; // 1.25 second delay (25 ticks) - gives tablist time to populate
 
     private static PendingReport pendingReport = null;
     private static int snapshotDelayTicks = 0; // shared delay: captures (end of previous round) AND (start of current round)
     private static int lastRoundTitleSeen = 0;
     private static int titleMissingTicks = 0; // Count ticks where title is missing before resetting (prevents false resets during transitions)
     private static int round1TickCounter = 0; // Counter for Round 1 debug logging
+    private static boolean chatMessagesEnabled = true; // Toggle for chat messages
+    private static boolean debugEnabled = false; // Runtime debug toggle (can be toggled via command)
 
     private static final class PendingReport {
         final int round;
@@ -229,53 +231,183 @@ public class KillsGoldTracker {
     private static void captureStats(Map<String, PlayerStats> storage) {
         storage.clear();
 
-        // Try scoreboard-based capture first (matches original ShowSpawnTime flow)
-        List<String> playerNames = getPlayerNamesFromScoreboard();
+        // First, parse the entire scoreboard and extract all player name -> gold mappings
+        // This ensures we capture gold values even if name matching is imperfect
+        Map<String, Integer> scoreboardGoldMap = new HashMap<>();
+        for (int i = 6; i <= YogurtRecapMod.getScoreboardManager().getSize(); i++) {
+            String content = YogurtRecapMod.getScoreboardManager().getContent(i);
+            
+            // Skip empty lines or lines starting with space
+            if (content.startsWith(" ") || content.isEmpty()) {
+                continue;
+            }
 
-        for (String playerName : playerNames) {
-            NetworkPlayerInfo playerInfo = getPlayerInfoFromTablist(playerName);
-            if (playerInfo != null) {
-                // IMPORTANT: Use canonical username (GameProfile.getName()) as the key, not the scoreboard name.
-                // This ensures consistent keys between snapshots even if scoreboard/tablist show names differently.
-                String canonicalUsername = playerInfo.getGameProfile() != null ? playerInfo.getGameProfile().getName() : null;
-                if (canonicalUsername == null || canonicalUsername.isEmpty()) {
-                    continue;
-                }
-                
-                int kills = getKillsFromTablist(playerInfo);
-                // Try getting gold using both the scoreboard name (for scoreboard-based lookup) and canonical username (fallback)
-                int gold = getGoldFromScoreboard(playerName);
-                if (gold == 0 && !playerName.equals(canonicalUsername)) {
-                    // If scoreboard name lookup failed, try with canonical username
-                    gold = getGoldFromScoreboard(canonicalUsername);
-                }
+            String colon = content.contains(":") ? ":" : (content.contains("：") ? "：" : "");
+            if (colon.isEmpty()) {
+                continue;
+            }
 
-                storage.put(canonicalUsername, new PlayerStats(kills, gold));
+            // Use indexOf instead of split to handle cases where colon might appear in formatting codes
+            int colonIndex = content.indexOf(colon);
+            if (colonIndex < 0) {
+                colonIndex = content.indexOf("：");
+            }
+            if (colonIndex < 0) {
+                continue;
+            }
+
+            // Extract player name (everything before the colon)
+            String rawName = content.substring(0, colonIndex);
+            // Extract gold part (everything after the colon)
+            String goldPartRaw = content.substring(colonIndex + colon.length());
+
+            // Extract and clean player name - try multiple methods
+            String scoreboardPlayerName = stripFormatting(rawName.trim());
+            if (scoreboardPlayerName.isEmpty()) {
+                scoreboardPlayerName = StringUtils.trim(rawName);
+            }
+            // If still empty, try removing all formatting codes manually
+            if (scoreboardPlayerName.isEmpty()) {
+                scoreboardPlayerName = rawName.replaceAll("§.", "").trim();
+            }
+            if (scoreboardPlayerName.isEmpty()) {
+                continue;
+            }
+
+            // Extract gold value (use the goldPartRaw we extracted above)
+            String goldPart = StringUtils.trim(goldPartRaw);
+            goldPart = goldPart.replaceAll("§.", ""); // Remove color codes
+            goldPart = goldPart.replaceAll("[,\\s]", ""); // Remove commas and spaces
+            
+            int gold = 0;
+            try {
+                gold = Integer.parseInt(goldPart);
+            } catch (NumberFormatException e) {
+                // Try to extract any sequence of digits
+                String numbers = goldPart.replaceAll("[^0-9]", "");
+                if (!numbers.isEmpty()) {
+                    try {
+                        gold = Integer.parseInt(numbers);
+                    } catch (NumberFormatException ex) {
+                        // Keep gold as 0
+                    }
+                }
+            }
+
+            // Store the scoreboard name -> gold mapping
+            // Store both the exact name and a normalized version (lowercase, no extra spaces) for better matching
+            scoreboardGoldMap.put(scoreboardPlayerName, gold);
+            // Also store lowercase version for case-insensitive matching
+            String normalizedName = scoreboardPlayerName.toLowerCase().trim();
+            if (!normalizedName.equals(scoreboardPlayerName.toLowerCase())) {
+                scoreboardGoldMap.put(normalizedName, gold);
             }
         }
 
-        // ALWAYS supplement with tablist enumeration to catch any players missed by scoreboard parsing.
-        // This helps when:
-        // - Scoreboard has gaps/empty lines that cause early break
-        // - Scoreboard gold lines haven't appeared yet but tablist is ready
-        // - Player names don't match exactly between scoreboard and tablist
+        // Now iterate through all players in tablist and match them to scoreboard data
         if (minecraft != null && minecraft.thePlayer != null && minecraft.thePlayer.sendQueue != null) {
             Collection<NetworkPlayerInfo> allPlayers = minecraft.thePlayer.sendQueue.getPlayerInfoMap();
             for (NetworkPlayerInfo info : allPlayers) {
                 if (info.getGameProfile() == null) continue;
-                String username = info.getGameProfile().getName();
-                if (username == null || username.isEmpty()) continue;
+                String canonicalUsername = info.getGameProfile().getName();
+                if (canonicalUsername == null || canonicalUsername.isEmpty()) continue;
                 // Skip NPCs / non-players (Hypixel NPCs often have weird names)
-                if (username.startsWith("!") || username.length() < 3 || username.length() > 16) continue;
+                if (canonicalUsername.startsWith("!") || canonicalUsername.length() < 3 || canonicalUsername.length() > 16) continue;
 
-                // Only add if not already captured from scoreboard (avoid duplicates)
-                if (!storage.containsKey(username)) {
-                    int kills = getKillsFromTablist(info);
-                    int gold = getGoldFromScoreboard(username);
+                int kills = getKillsFromTablist(info);
+                
+                // Try multiple strategies to find gold:
+                // 1. Exact match (case-sensitive)
+                // 2. Exact match (case-insensitive)
+                // 3. Fuzzy match: check if scoreboard name ends with canonical username (handles rank prefixes)
+                // 4. Fuzzy match: check if canonical username is contained in scoreboard name
+                int gold = 0;
+                
+                // Strategy 1: Exact match (case-sensitive)
+                gold = scoreboardGoldMap.getOrDefault(canonicalUsername, 0);
+                
+                // Strategy 2: Case-insensitive exact match
+                if (gold == 0) {
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        if (entry.getKey().equalsIgnoreCase(canonicalUsername)) {
+                            gold = entry.getValue();
+                            break;
+                        }
+                    }
+                }
+                
+                // Strategy 3: Scoreboard name ends with canonical username (handles rank prefixes like "[VIP] PlayerName")
+                if (gold == 0) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        String scoreboardName = entry.getKey();
+                        String scoreboardLower = scoreboardName.toLowerCase();
+                        // Check if scoreboard name ends with canonical username
+                        if (scoreboardLower.endsWith(canonicalLower) && scoreboardLower.length() > canonicalLower.length()) {
+                            gold = entry.getValue();
+                            break;
+                        }
+                    }
+                }
+                
+                // Strategy 4: Scoreboard name starts with canonical username (handles cases where scoreboard has prefix)
+                if (gold == 0) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        String scoreboardName = entry.getKey();
+                        String scoreboardLower = scoreboardName.toLowerCase();
+                        // Check if scoreboard name starts with canonical username
+                        if (scoreboardLower.startsWith(canonicalLower) && scoreboardLower.length() >= canonicalLower.length()) {
+                            gold = entry.getValue();
+                            break;
+                        }
+                    }
+                }
+                
+                // Strategy 5: Canonical username is contained in scoreboard name (more lenient, but with better safeguards)
+                if (gold == 0) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        String scoreboardName = entry.getKey();
+                        String scoreboardLower = scoreboardName.toLowerCase();
+                        // Check if scoreboard name contains canonical username
+                        // Make sure it's not a false positive (e.g., "Player" matching "Player12")
+                        if (scoreboardLower.contains(canonicalLower)) {
+                            // For long usernames (>= 10 chars), be more lenient
+                            // For shorter usernames, require at least 4 chars to avoid false matches
+                            if (canonicalLower.length() >= 10 || (canonicalLower.length() >= 4 && scoreboardLower.length() <= canonicalLower.length() + 5)) {
+                                gold = entry.getValue();
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Strategy 6: Last resort - check if any part of the scoreboard name matches (for edge cases)
+                // This handles cases where the name might be formatted weirdly or truncated
+                if (gold == 0 && canonicalUsername.length() >= 10) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    // Try matching last 10+ characters of canonical username
+                    String canonicalSuffix = canonicalLower.length() >= 10 ? canonicalLower.substring(canonicalLower.length() - 10) : canonicalLower;
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        String scoreboardName = entry.getKey();
+                        String scoreboardLower = scoreboardName.toLowerCase();
+                        // Check if scoreboard name ends with the suffix of canonical username
+                        if (scoreboardLower.endsWith(canonicalSuffix) && scoreboardLower.length() >= canonicalSuffix.length()) {
+                            gold = entry.getValue();
+                            break;
+                        }
+                    }
+                }
 
-                    // Include player even if kills/gold are 0 (they might have 0 at round start)
-                    // Only skip if we can't find them in tablist at all
-                    storage.put(username, new PlayerStats(kills, gold));
+                storage.put(canonicalUsername, new PlayerStats(kills, gold));
+                
+                // Debug logging for specific problematic username
+                if (ModConfig.KILLS_GOLD_TRACKER_DEBUG && canonicalUsername.equalsIgnoreCase("Melonapplesauce")) {
+                    debug("Gold lookup for " + canonicalUsername + ": found=" + gold + ", scoreboardMapSize=" + scoreboardGoldMap.size());
+                    if (gold == 0) {
+                        debug("Scoreboard entries: " + scoreboardGoldMap.keySet().toString());
+                    }
                 }
             }
         }
@@ -536,41 +668,84 @@ public class KillsGoldTracker {
             }
         }
 
-        // Sort by kills (descending)
+        // Sort by full round kills (descending)
         roundDiffs.sort((a, b) -> Integer.compare(b.kills, a.kills));
-        lastWaveDiffs.sort((a, b) -> Integer.compare(b.kills, a.kills));
+
+        // Create a map for quick last wave lookup
+        Map<String, PlayerStatsDiff> lastWaveMap = new HashMap<>();
+        for (PlayerStatsDiff diff : lastWaveDiffs) {
+            lastWaveMap.put(diff.playerName, diff);
+        }
+
+        // Find the longest username length in the team
+        int longestUsernameLength = 0;
+        for (PlayerStatsDiff diff : roundDiffs) {
+            int length = diff.playerName.length();
+            if (length > longestUsernameLength) {
+                longestUsernameLength = length;
+            }
+        }
 
         // Build single multi-line message
         StringBuilder messageBuilder = new StringBuilder();
         messageBuilder.append(EnumChatFormatting.GOLD).append(EnumChatFormatting.STRIKETHROUGH).append("━━━━━━━━━━━━━━━━━━━━━\n");
-        messageBuilder.append(EnumChatFormatting.YELLOW).append(EnumChatFormatting.BOLD).append("Round ").append(report.round).append(" Complete!\n");
-        messageBuilder.append("\n");
 
-        // Show full round stats
-        messageBuilder.append(EnumChatFormatting.AQUA).append("Full Round:\n");
-        for (PlayerStatsDiff diff : roundDiffs) {
-            messageBuilder.append(EnumChatFormatting.WHITE).append("  ").append(diff.playerName).append(": ");
-            messageBuilder.append(EnumChatFormatting.RED).append(diff.kills).append(" kills ");
-            messageBuilder.append(EnumChatFormatting.GRAY).append("| ");
-            messageBuilder.append(EnumChatFormatting.GOLD).append("+").append(diff.gold).append(" gold\n");
-        }
-
-        // Show last wave stats if available
-        if (!lastWaveDiffs.isEmpty()) {
-            messageBuilder.append("\n");
-            messageBuilder.append(EnumChatFormatting.AQUA).append("Last Wave:\n");
-            for (PlayerStatsDiff diff : lastWaveDiffs) {
-                messageBuilder.append(EnumChatFormatting.WHITE).append("  ").append(diff.playerName).append(": ");
-                messageBuilder.append(EnumChatFormatting.RED).append(diff.kills).append(" kills ");
-                messageBuilder.append(EnumChatFormatting.GRAY).append("| ");
-                messageBuilder.append(EnumChatFormatting.GOLD).append("+").append(diff.gold).append(" gold\n");
+        // Format each player with aligned stats
+        for (PlayerStatsDiff roundDiff : roundDiffs) {
+            String playerName = roundDiff.playerName;
+            int roundKills = roundDiff.kills;
+            int roundGold = roundDiff.gold;
+            
+            // Get last wave stats if available
+            PlayerStatsDiff lastWaveDiff = lastWaveMap.get(playerName);
+            int lastWaveKills = (lastWaveDiff != null) ? lastWaveDiff.kills : 0;
+            int lastWaveGold = (lastWaveDiff != null) ? lastWaveDiff.gold : 0;
+            
+            // Calculate alignment: spaces after colon = longestUsernameLength - currentUsernameLength + 1
+            // This ensures at least 1 space, and aligns all usernames to the same column
+            int usernameLength = playerName.length();
+            int spacesAfterColon = longestUsernameLength - usernameLength + 1;
+            
+            // Build the line: PlayerName: [spaces] kills/gold | kills/gold
+            messageBuilder.append(EnumChatFormatting.WHITE).append(playerName).append(":");
+            
+            // Add alignment spaces
+            for (int i = 0; i < spacesAfterColon; i++) {
+                messageBuilder.append(" ");
             }
+            
+            // Full round stats: kills/gold
+            messageBuilder.append(EnumChatFormatting.RED).append(roundKills);
+            messageBuilder.append(EnumChatFormatting.GRAY).append("/");
+            messageBuilder.append(EnumChatFormatting.GOLD).append(roundGold);
+            
+            // Separator and last wave stats
+            messageBuilder.append("  "); // Two spaces before pipe
+            messageBuilder.append(EnumChatFormatting.WHITE).append("|");
+            messageBuilder.append("  "); // Two spaces after pipe
+            
+            // Last wave stats: kills/gold
+            messageBuilder.append(EnumChatFormatting.RED).append(lastWaveKills);
+            messageBuilder.append(EnumChatFormatting.GRAY).append("/");
+            messageBuilder.append(EnumChatFormatting.GOLD).append(lastWaveGold);
+            
+            messageBuilder.append("\n");
         }
 
         messageBuilder.append(EnumChatFormatting.GOLD).append(EnumChatFormatting.STRIKETHROUGH).append("━━━━━━━━━━━━━━━━━━━━━");
 
-        // Send as single message
-        PlayerUtils.sendMessage(messageBuilder.toString());
+        // Send as single message (only if chat messages are enabled)
+        if (chatMessagesEnabled) {
+            PlayerUtils.sendMessage(messageBuilder.toString());
+        }
+    }
+
+    public static boolean isChatMessagesEnabled() {
+        return chatMessagesEnabled;
+    }
+
+    public static void setChatMessagesEnabled(boolean enabled) {
+        chatMessagesEnabled = enabled;
     }
 
     private static Map<String, PlayerStats> copyStatsMap(Map<String, PlayerStats> input) {
@@ -634,13 +809,22 @@ public class KillsGoldTracker {
     }
 
     private static void debug(String msg) {
-        if (!ModConfig.KILLS_GOLD_TRACKER_DEBUG) {
+        // Debug is enabled if either config is enabled OR runtime toggle is enabled
+        if (!ModConfig.KILLS_GOLD_TRACKER_DEBUG && !debugEnabled) {
             return;
         }
         if (minecraft == null || minecraft.thePlayer == null) {
             return;
         }
         minecraft.thePlayer.addChatMessage(new ChatComponentText(EnumChatFormatting.DARK_GRAY + "[KGT DEBUG] " + msg));
+    }
+
+    public static boolean isDebugEnabled() {
+        return debugEnabled;
+    }
+
+    public static void setDebugEnabled(boolean enabled) {
+        debugEnabled = enabled;
     }
 
     // Helper class for player stats difference

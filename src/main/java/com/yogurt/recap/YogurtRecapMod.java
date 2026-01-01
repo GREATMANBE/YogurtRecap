@@ -1,10 +1,13 @@
 package com.yogurt.recap;
 
+import com.yogurt.recap.commands.RecapCommand;
+import com.yogurt.recap.commands.RecapDebugCommand;
 import com.yogurt.recap.config.ModConfig;
 import com.yogurt.recap.features.killsgoldtracker.KillsGoldTracker;
 import com.yogurt.recap.features.spawntimes.SpawnTimes;
 import com.yogurt.recap.handler.RoundTimer;
 import com.yogurt.recap.handler.ScoreboardManager;
+import net.minecraftforge.client.ClientCommandHandler;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.common.config.Configuration;
 import net.minecraftforge.fml.common.Mod;
@@ -47,6 +50,10 @@ public class YogurtRecapMod {
         MinecraftForge.EVENT_BUS.register(ROUND_TIMER);
         MinecraftForge.EVENT_BUS.register(SPAWN_TIMES);
         MinecraftForge.EVENT_BUS.register(killsGoldTracker = new KillsGoldTracker());
+        
+        // Register client-side commands
+        ClientCommandHandler.instance.registerCommand(new RecapCommand());
+        ClientCommandHandler.instance.registerCommand(new RecapDebugCommand());
     }
 
     public static Logger getLogger() {
