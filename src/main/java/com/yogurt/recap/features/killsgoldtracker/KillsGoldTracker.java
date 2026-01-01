@@ -302,6 +302,23 @@ public class KillsGoldTracker {
             if (!normalizedName.equals(scoreboardPlayerName.toLowerCase())) {
                 scoreboardGoldMap.put(normalizedName, gold);
             }
+            
+            // Special handling for long names (14+ chars): also store prefix versions
+            // This handles cases where the scoreboard might truncate long names
+            if (scoreboardPlayerName.length() >= 14) {
+                // Store first 14 characters as a key (in case it's truncated)
+                String prefix14 = scoreboardPlayerName.substring(0, Math.min(14, scoreboardPlayerName.length()));
+                scoreboardGoldMap.put(prefix14.toLowerCase(), gold);
+                // Also store first 13 and 15 characters for better matching
+                if (scoreboardPlayerName.length() >= 13) {
+                    String prefix13 = scoreboardPlayerName.substring(0, 13);
+                    scoreboardGoldMap.put(prefix13.toLowerCase(), gold);
+                }
+                if (scoreboardPlayerName.length() >= 15) {
+                    String prefix15 = scoreboardPlayerName.substring(0, 15);
+                    scoreboardGoldMap.put(prefix15.toLowerCase(), gold);
+                }
+            }
         }
 
         // Now iterate through all players in tablist and match them to scoreboard data
@@ -383,7 +400,39 @@ public class KillsGoldTracker {
                     }
                 }
                 
-                // Strategy 6: Last resort - check if any part of the scoreboard name matches (for edge cases)
+                // Strategy 6: Special handling for long usernames (15-16 chars) - they might be truncated on scoreboard
+                // Try matching using prefixes (we stored prefix versions in the map)
+                if (gold == 0 && canonicalUsername.length() >= 15) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    // Try matching with first 14, 13, or 15 characters (stored as keys in the map)
+                    String prefix14 = canonicalLower.substring(0, Math.min(14, canonicalLower.length()));
+                    gold = scoreboardGoldMap.getOrDefault(prefix14, 0);
+                    
+                    if (gold == 0 && canonicalLower.length() >= 13) {
+                        String prefix13 = canonicalLower.substring(0, 13);
+                        gold = scoreboardGoldMap.getOrDefault(prefix13, 0);
+                    }
+                    
+                    if (gold == 0 && canonicalLower.length() >= 15) {
+                        String prefix15 = canonicalLower.substring(0, 15);
+                        gold = scoreboardGoldMap.getOrDefault(prefix15, 0);
+                    }
+                    
+                    // Also try reverse: check if any scoreboard name is a prefix of canonical username
+                    if (gold == 0) {
+                        for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                            String scoreboardName = entry.getKey();
+                            String scoreboardLower = scoreboardName.toLowerCase();
+                            // Check if canonical username starts with scoreboard name (scoreboard is truncated)
+                            if (canonicalLower.startsWith(scoreboardLower) && scoreboardLower.length() >= 13) {
+                                gold = entry.getValue();
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Strategy 7: Last resort - check if any part of the scoreboard name matches (for edge cases)
                 // This handles cases where the name might be formatted weirdly or truncated
                 if (gold == 0 && canonicalUsername.length() >= 10) {
                     String canonicalLower = canonicalUsername.toLowerCase();
@@ -399,14 +448,39 @@ public class KillsGoldTracker {
                         }
                     }
                 }
+                
+                // Strategy 8: For long names, try matching any substring of 12+ characters
+                if (gold == 0 && canonicalUsername.length() >= 15) {
+                    String canonicalLower = canonicalUsername.toLowerCase();
+                    // Try matching with a 12-character substring from the middle/end
+                    int startIdx = Math.max(0, canonicalLower.length() - 12);
+                    String canonicalSubstring = canonicalLower.substring(startIdx);
+                    for (Map.Entry<String, Integer> entry : scoreboardGoldMap.entrySet()) {
+                        String scoreboardName = entry.getKey();
+                        String scoreboardLower = scoreboardName.toLowerCase();
+                        // Check if scoreboard name contains this substring
+                        if (scoreboardLower.contains(canonicalSubstring) && canonicalSubstring.length() >= 12) {
+                            gold = entry.getValue();
+                            break;
+                        }
+                    }
+                }
 
                 storage.put(canonicalUsername, new PlayerStats(kills, gold));
                 
-                // Debug logging for specific problematic username
-                if (ModConfig.KILLS_GOLD_TRACKER_DEBUG && canonicalUsername.equalsIgnoreCase("Melonapplesauce")) {
-                    debug("Gold lookup for " + canonicalUsername + ": found=" + gold + ", scoreboardMapSize=" + scoreboardGoldMap.size());
+                // Debug logging for all players when debug is enabled
+                if (ModConfig.KILLS_GOLD_TRACKER_DEBUG || debugEnabled) {
+                    debug("Gold lookup for " + canonicalUsername + " (len=" + canonicalUsername.length() + "): found=" + gold + ", scoreboardMapSize=" + scoreboardGoldMap.size());
                     if (gold == 0) {
                         debug("Scoreboard entries: " + scoreboardGoldMap.keySet().toString());
+                        // Also show what matching strategies were tried
+                        String canonicalLower = canonicalUsername.toLowerCase();
+                        debug("Tried matching: exact='" + canonicalUsername + "', lowercase='" + canonicalLower + "'");
+                        if (canonicalUsername.length() >= 15) {
+                            debug("Long name prefixes: 13='" + canonicalLower.substring(0, Math.min(13, canonicalLower.length())) + 
+                                  "', 14='" + canonicalLower.substring(0, Math.min(14, canonicalLower.length())) + 
+                                  "', 15='" + canonicalLower.substring(0, Math.min(15, canonicalLower.length())) + "'");
+                        }
                     }
                 }
             }
