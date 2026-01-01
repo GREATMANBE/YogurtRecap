@@ -63,6 +63,20 @@ public class KillsGoldTracker {
                 + " snapshotDelayTicks=" + snapshotDelayTicks
                 + " pendingReport=" + (pendingReport != null ? ("round=" + pendingReport.round + " startSize=" + pendingReport.roundStart.size()) : "null"));
 
+        // Detect new game: if we see Round 1 but currentRound > 1, that means we started a new game
+        // (you can't go backwards in rounds within a single game session).
+        if (newRound == 1 && currentRound > 1) {
+            reset();
+            debug("Reset state because newRound=1 but currentRound=" + currentRound + " (new game detected)");
+        }
+
+        // If currentRound is 0, we're starting fresh (new game or just joined).
+        // Reset everything to ensure clean state, especially if joining mid-game (Round 2+).
+        if (currentRound == 0) {
+            reset();
+            debug("Reset state because currentRound was 0 (new game/joined mid-game)");
+        }
+
         // If we're transitioning from an existing round to a new round, schedule report for the old round.
         if (currentRound > 0 && newRound != currentRound && pendingReport == null) {
             pendingReport = new PendingReport(
@@ -221,17 +235,31 @@ public class KillsGoldTracker {
         for (String playerName : playerNames) {
             NetworkPlayerInfo playerInfo = getPlayerInfoFromTablist(playerName);
             if (playerInfo != null) {
+                // IMPORTANT: Use canonical username (GameProfile.getName()) as the key, not the scoreboard name.
+                // This ensures consistent keys between snapshots even if scoreboard/tablist show names differently.
+                String canonicalUsername = playerInfo.getGameProfile() != null ? playerInfo.getGameProfile().getName() : null;
+                if (canonicalUsername == null || canonicalUsername.isEmpty()) {
+                    continue;
+                }
+                
                 int kills = getKillsFromTablist(playerInfo);
+                // Try getting gold using both the scoreboard name (for scoreboard-based lookup) and canonical username (fallback)
                 int gold = getGoldFromScoreboard(playerName);
+                if (gold == 0 && !playerName.equals(canonicalUsername)) {
+                    // If scoreboard name lookup failed, try with canonical username
+                    gold = getGoldFromScoreboard(canonicalUsername);
+                }
 
-                storage.put(playerName, new PlayerStats(kills, gold));
+                storage.put(canonicalUsername, new PlayerStats(kills, gold));
             }
         }
 
-        // Fallback: if scoreboard-based capture failed, try direct tablist enumeration.
-        // This helps when the scoreboard gold lines haven't appeared yet but tablist is ready.
-        if (storage.isEmpty() && minecraft != null && minecraft.thePlayer != null && minecraft.thePlayer.sendQueue != null) {
-            debug("Scoreboard capture empty, trying direct tablist fallback");
+        // ALWAYS supplement with tablist enumeration to catch any players missed by scoreboard parsing.
+        // This helps when:
+        // - Scoreboard has gaps/empty lines that cause early break
+        // - Scoreboard gold lines haven't appeared yet but tablist is ready
+        // - Player names don't match exactly between scoreboard and tablist
+        if (minecraft != null && minecraft.thePlayer != null && minecraft.thePlayer.sendQueue != null) {
             Collection<NetworkPlayerInfo> allPlayers = minecraft.thePlayer.sendQueue.getPlayerInfoMap();
             for (NetworkPlayerInfo info : allPlayers) {
                 if (info.getGameProfile() == null) continue;
@@ -240,11 +268,13 @@ public class KillsGoldTracker {
                 // Skip NPCs / non-players (Hypixel NPCs often have weird names)
                 if (username.startsWith("!") || username.length() < 3 || username.length() > 16) continue;
 
-                int kills = getKillsFromTablist(info);
-                int gold = getGoldFromScoreboard(username);
+                // Only add if not already captured from scoreboard (avoid duplicates)
+                if (!storage.containsKey(username)) {
+                    int kills = getKillsFromTablist(info);
+                    int gold = getGoldFromScoreboard(username);
 
-                // Only include if we got meaningful data
-                if (kills > 0 || gold > 0) {
+                    // Include player even if kills/gold are 0 (they might have 0 at round start)
+                    // Only skip if we can't find them in tablist at all
                     storage.put(username, new PlayerStats(kills, gold));
                 }
             }
@@ -256,54 +286,79 @@ public class KillsGoldTracker {
 
         for (int i = 6; i <= YogurtRecapMod.getScoreboardManager().getSize(); i++) {
             String content = YogurtRecapMod.getScoreboardManager().getContent(i);
+            
+            // Skip empty lines or lines starting with space, but continue scanning (don't break)
+            // This allows us to find players even if there are gaps in the scoreboard
             if (content.startsWith(" ") || content.isEmpty()) {
-                break;
+                continue;
             }
 
             String colon = content.contains(":") ? ":" : (content.contains("：") ? "：" : "");
+            // If no colon found, this line isn't a player gold line - skip it but continue
             if (colon.isEmpty()) {
-                break;
+                continue;
             }
 
             String playerName = stripFormatting(StringUtils.trim(content.split(colon)[0]));
-            playerNames.add(playerName);
+            // Only add if we got a valid player name
+            if (!playerName.isEmpty()) {
+                playerNames.add(playerName);
+            }
         }
 
         return playerNames;
     }
 
     private static int getGoldFromScoreboard(String playerName) {
+        // Normalize the target player name (strip formatting for comparison)
+        String targetName = stripFormatting(playerName);
+        if (targetName.isEmpty()) {
+            return 0;
+        }
+
         for (int i = 6; i <= YogurtRecapMod.getScoreboardManager().getSize(); i++) {
             String content = YogurtRecapMod.getScoreboardManager().getContent(i);
+            
+            // Skip empty lines or lines starting with space
+            if (content.startsWith(" ") || content.isEmpty()) {
+                continue;
+            }
 
-            // Check if this line contains the player name
-            if (content.contains(playerName)) {
-                String colon = content.contains(":") ? ":" : (content.contains("：") ? "：" : "");
-                if (!colon.isEmpty()) {
-                    String[] parts = content.split(colon);
-                    if (parts.length >= 2) {
-                        // Gold is the number after the colon
-                        String goldPart = StringUtils.trim(parts[1]);
+            String colon = content.contains(":") ? ":" : (content.contains("：") ? "：" : "");
+            if (colon.isEmpty()) {
+                continue;
+            }
 
-                        // Remove all color codes (§ followed by any character)
-                        goldPart = goldPart.replaceAll("§.", "");
+            // Extract player name from this scoreboard line (same logic as getPlayerNamesFromScoreboard)
+            String[] parts = content.split(colon);
+            if (parts.length < 2) {
+                continue;
+            }
+            String linePlayerName = stripFormatting(StringUtils.trim(parts[0]));
 
-                        // Remove commas and spaces
-                        goldPart = goldPart.replaceAll("[,\\s]", "");
+            // Match exactly (after stripping formatting) to avoid partial matches
+            // (e.g., "Player" shouldn't match "Player12")
+            if (linePlayerName.equals(targetName)) {
+                // Gold is the number after the colon
+                String goldPart = StringUtils.trim(parts[1]);
 
-                        // Extract just the numbers
+                // Remove all color codes (§ followed by any character)
+                goldPart = goldPart.replaceAll("§.", "");
+
+                // Remove commas and spaces
+                goldPart = goldPart.replaceAll("[,\\s]", "");
+
+                // Extract just the numbers
+                try {
+                    return Integer.parseInt(goldPart);
+                } catch (NumberFormatException e) {
+                    // If parsing fails, try to extract any sequence of digits
+                    String numbers = goldPart.replaceAll("[^0-9]", "");
+                    if (!numbers.isEmpty()) {
                         try {
-                            return Integer.parseInt(goldPart);
-                        } catch (NumberFormatException e) {
-                            // If parsing fails, try to extract any sequence of digits
-                            String numbers = goldPart.replaceAll("[^0-9]", "");
-                            if (!numbers.isEmpty()) {
-                                try {
-                                    return Integer.parseInt(numbers);
-                                } catch (NumberFormatException ex) {
-                                    return 0;
-                                }
-                            }
+                            return Integer.parseInt(numbers);
+                        } catch (NumberFormatException ex) {
+                            return 0;
                         }
                     }
                 }
@@ -532,7 +587,7 @@ public class KillsGoldTracker {
         return copy;
     }
 
-    private void reset() {
+    private static void reset() {
         roundStartStats.clear();
         lastWaveStartStats.clear();
         currentRound = 0;
